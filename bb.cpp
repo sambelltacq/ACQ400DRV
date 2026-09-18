@@ -391,6 +391,33 @@ int _load() {
 	return _load_pad(nsamples);
 }
 
+#define AXI_BUS_BS	3		/* 64 bit bus: 1<<3 = 8 bytes	*/
+#define AXI_FIFO_BS	2		/* FIFO port:  1<<2 = 4 bytes	*/
+
+/* The PL330 derives its burst geometry from the byte count, then halves the
+ * burst length for the narrower FIFO port, and refuses the transfer unless
+ * bytes is a multiple of BRST_SIZE*BRST_LEN. 
+ */
+static unsigned pl330_awg_quantum(unsigned bytes)
+{
+	unsigned bs, bl, brst_len;
+
+	for (bs = AXI_BUS_BS; bs > 0; --bs){
+		if (bytes % (1<<bs) == 0) break;
+	}
+	for (bl = 16; bl > 1; --bl){
+		if (bytes % (bl<<bs) == 0) break;
+	}
+	brst_len = bs > AXI_FIFO_BS? (((bl >> (bs-AXI_FIFO_BS)) - 1)&0xf) + 1: 1;
+
+	return (1<<bs) * brst_len;		/* driver prints this as SIZ*LEN */
+}
+
+static bool pl330_awg_len_ok(unsigned bytes)
+{
+	return bytes % pl330_awg_quantum(bytes) == 0;
+}
+
 int _load_by_buffer() {
 	unsigned spb = G::play_bufferlen/G::sample_size;
 	unsigned nsamples = 0;
@@ -402,8 +429,34 @@ int _load_by_buffer() {
 			nsamples += nread;
 		}else{
 			if (buf == 1 && nread < spb){
-				fprintf(stderr, "single buffer no pad %d < %d\n", nsamples, spb);
-				return nsamples; 		// NO PAD, PING only
+				/*
+				 * PING-only: append whole samples until the DMAC will
+				 * accept the byte count.
+				 */
+				unsigned nsam0 = nsamples;
+				unsigned bytes0 = nsamples*G::sample_size;
+
+				if (nsamples > 0){
+					char* base = Buffer::the_buffers[0]->getBase();
+					char* last = base + nsamples*G::sample_size - G::sample_size;
+					char* zero = 0;
+
+					if (G::pad == G_PAD_ZERO){
+						zero = new char[G::sample_size]();
+						last = zero;
+					}
+					while (nsamples < spb &&
+					       !pl330_awg_len_ok(nsamples*G::sample_size)){
+						memcpy(base + nsamples*G::sample_size,
+						       last, G::sample_size);
+						nsamples++;
+					}
+					delete [] zero;
+				}
+				printf("single buffer %u samples %u bytes quantum:%u pad:%u -> %u samples %u bytes\n",
+					nsam0, bytes0, pl330_awg_quantum(bytes0),
+					nsamples-nsam0, nsamples, nsamples*G::sample_size);
+				return nsamples; 		// PING only
 			}
 			if (ferror(G::fp_in)){
 				syslog(LOG_DEBUG, "bb fread ERROR exit");
